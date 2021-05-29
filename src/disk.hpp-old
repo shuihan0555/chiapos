@@ -22,8 +22,6 @@
 #include <vector>
 #include <thread>
 #include <chrono>
-#include <unistd.h>
-#include <sys/uio.h>
 
 // enables disk I/O logging to disk.log
 // use tools/disk.gnuplot to generate a plot
@@ -36,7 +34,6 @@ using namespace std::chrono_literals; // for operator""min;
 #include "./bits.hpp"
 #include "./util.hpp"
 #include "bitfield.hpp"
-#include "concurrentqueue/concurrentqueue.h"
 
 constexpr uint64_t write_cache = 1024 * 1024;
 constexpr uint64_t read_ahead = 1024 * 1024;
@@ -100,81 +97,12 @@ void disk_log(fs::path const& filename, op_t const op, uint64_t offset, uint64_t
 }
 #endif
 
-struct BufferedDiskMeta {
-	uint8_t* data;
-	uint64_t length;
-	uint64_t begin;
-	BufferedDiskMeta() {
-		data = nullptr;
-		length = 0;
-		begin = 0;
-	}
-
-	BufferedDiskMeta(const uint8_t* buff, uint64_t length, uint64_t begin) {
-		data = (uint8_t*)malloc(length);
-		memcpy(data, buff, length);
-		this->length = length;
-		this->begin = begin;
-	}
-
-	BufferedDiskMeta(const BufferedDiskMeta& r) = delete;
-	BufferedDiskMeta& operator=(const BufferedDiskMeta& r) = delete;
-	BufferedDiskMeta(BufferedDiskMeta&& r) {
-		data = r.data;
-		length = r.length;
-		begin = r.begin;
-		r.data = nullptr;
-		r.begin = 0;
-	}
-
-	BufferedDiskMeta& operator=(BufferedDiskMeta&& r) {
-		if (this == &r) {
-			return *this;
-		}
-		if (data != nullptr) {
-			free(data);
-		}
-
-		data = r.data;
-		length = r.length;
-		begin = r.begin;
-		r.data = nullptr;
-		r.length = 0;
-		r.begin = 0;
-
-		return *this;
-	}
-
-	~BufferedDiskMeta() {
-		if (data != nullptr) {
-			free(data);
-			data = nullptr;
-			length = 0;
-			begin = 0;
-		}
-	}
-};
-
 struct FileDisk {
-#if !defined(FREE_WRITE)
     explicit FileDisk(const fs::path &filename)
     {
         filename_ = filename;
         Open(writeFlag);
-		async_ = false;
     }
-#else
-    explicit FileDisk(const fs::path &filename, bool async=true)
-    {
-        filename_ = filename;
-		async_ = async;
-        Open(writeFlag);
-		if (async_) {
-			std::thread t(&FileDisk::Async, this);
-			thread_queue_= std::move(t);
-		}
-    }
-#endif
 
     void Open(uint8_t flags = 0)
     {
@@ -220,12 +148,7 @@ struct FileDisk {
         writePos = 0;
     }
 
-    ~FileDisk() { 
-		if (async_) {
-			thread_queue_.join();
-		}
-		Close(); 
-	}
+    ~FileDisk() { Close(); }
 
     void Read(uint64_t begin, uint8_t *memcache, uint64_t length)
     {
@@ -262,7 +185,6 @@ struct FileDisk {
         } while (amtread != length);
     }
 
-#if !defined(FREE_WRITE)
     void Write(uint64_t begin, const uint8_t *memcache, uint64_t length)
     {
         Open(writeFlag | retryOpenFlag);
@@ -311,131 +233,6 @@ struct FileDisk {
         } while (amtwritten != length);
     }
 
-#else
-    void Write(uint64_t begin, const uint8_t *memcache, uint64_t length)
-    {
-		//BufferedDiskMeta meta(memcache, length, begin);
-		BufferedDiskMeta*  meta = new BufferedDiskMeta(memcache, length, begin);
-		//queue_.enqueue(std::move(meta));
-		queue_.enqueue(meta);
-	}
-#endif
-
-	void SetRun() {
-		run_ = 0;
-	}
-
-	void Async() 
-	{
-		run_ = 1;
-		do {
-			BufferedDiskMeta* items[BULK_SIZE] = {};
-			struct iovec iov[BULK_SIZE];
-			int count = 0;
-			do {
-				size_t len = 0;
-				count = queue_.try_dequeue_bulk(items, BULK_SIZE);
-				int i = 0;
-				for(; i < count; ++i) {
-					if (len + items[i]->length >= LONG_MAX) {
-						break;
-					} else {
-						len +=items[i]->length;
-						iov[i].iov_base = (void*) items[i]->data;
-						iov[i].iov_len = items[i]->length;
-					}
-				}
-
-
-				Open(writeFlag | retryOpenFlag);
-#if ENABLE_LOGGING
-				disk_log(filename_, op_t::write, begin, length);
-#endif
-				uint64_t amtwritten;
-				int cnt = 0;
-				do {
-					if ((bReading) || (items[0]->begin != writePos)) {
-#ifdef _WIN32
-						_fseeki64(f_, items[0]->begin, SEEK_SET);
-#else
-						// fseek() takes a long as offset, make sure it's wide enough
-						//static_assert(sizeof(long) >= sizeof(begin));
-						::fseek(f_, items[0]->begin, SEEK_SET);
-#endif
-						bReading = false;
-					}
-					//amtwritten =::fwrite(reinterpret_cast<const char *>(memcache), sizeof(uint8_t), length, f_);
-					int fd = fileno(f_);
-					amtwritten = pwritev(fd, iov, i, items[0]->begin);
-					if (amtwritten != len) {
-						//std::cout << "Only wrote " << amtwritten << " of " << length << " bytes at offset "
-						//	<< begin << " to " << filename_ << " with length " << writeMax
-						//	<< ". Error " << ferror(f_) << ". Retrying in five minutes." << std::endl;
-						// Close, Reopen, and re-seek the file to recover in case the filesystem
-						// has been remounted.
-						Close();
-						bReading = false;
-						std::this_thread::sleep_for(1min);
-						Open(writeFlag | retryOpenFlag);
-					} else {
-						writePos += amtwritten;
-						break;
-					}
-				} while(true);
-
-				for (; i<count; ++i) 
-				{
-					do {
-						Open(writeFlag | retryOpenFlag);
-						if ((bReading) || (items[i]->begin != writePos)) {
-#ifdef _WIN32
-							_fseeki64(f_, items[i]->begin, SEEK_SET);
-#else
-							// fseek() takes a long as offset, make sure it's wide enough
-							//static_assert(sizeof(long) >= sizeof(begin));
-							::fseek(f_, items[i]->begin, SEEK_SET);
-#endif
-							bReading = false;
-						}
-						int fd = fileno(f_);
-						amtwritten = pwritev(fd, &iov[i], 1, items[i]->begin);
-						if (amtwritten != items[i]->length) {
-							std::cout << "Only wrote " << amtwritten << " of  bytes at offset "
-								<< ". Error " << ferror(f_) << ". Retrying in five minutes." << std::endl;
-							// Close, Reopen, and re-seek the file to recover in case the filesystem
-							// has been remounted.
-							Close();
-							bReading = false;
-							std::this_thread::sleep_for(1min);
-							Open(writeFlag | retryOpenFlag);
-						} else {
-							writePos += items[i]->length;
-							break;
-						}
-					} while(true);
-				}
-
-				bool finish = false;
-				if (items[i]->length == 0) {
-					finish = true;
-				}
-
-				for (int k=0; k<count; ++k) {
-					delete items[k];
-				}
-
-				if (finish) {
-					return;
-				}
-
-				if(count < BULK_SIZE){
-					break;
-				}
-			} while(true);
-			sleep(5);
-		}while(run_);
-    }
-
     std::string GetFileName() { return filename_.string(); }
 
     uint64_t GetWriteMax() const noexcept { return writeMax; }
@@ -445,10 +242,6 @@ struct FileDisk {
         Close();
         fs::resize_file(filename_, new_size);
     }
-
-	size_t GetSize() const {
-		return queue_.size_approx();
-	}
 
 private:
 
@@ -462,14 +255,7 @@ private:
 
     static const uint8_t writeFlag = 0b01;
     static const uint8_t retryOpenFlag = 0b10;
-
-	moodycamel::ConcurrentQueue<BufferedDiskMeta*> queue_;
-	std::thread thread_queue_;
-	const int BULK_SIZE = 100;
-	std::atomic<int> run_;
-	bool async_ = false;
 };
-
 
 struct BufferedDisk : Disk
 {
@@ -525,7 +311,6 @@ struct BufferedDisk : Disk
         }
     }
 
-#if !defined(FREE_WRITE)
     void Write(uint64_t const begin, const uint8_t *memcache, uint64_t const length) override
     {
         NeedWriteCache();
@@ -547,12 +332,6 @@ struct BufferedDisk : Disk
 
         disk_->Write(begin, memcache, length);
     }
-#else
-    void Write(uint64_t const begin, const uint8_t *memcache, uint64_t const length) override
-	{
-        disk_->Write(begin, memcache, length);
-	}
-#endif
 
     void Truncate(uint64_t const new_size) override
     {
@@ -574,7 +353,6 @@ struct BufferedDisk : Disk
         write_buffer_size_ = 0;
     }
 
-#if !defined(FREE_WRITE)
     void FlushCache()
     {
         if (write_buffer_size_ == 0) return;
@@ -582,21 +360,6 @@ struct BufferedDisk : Disk
         disk_->Write(write_buffer_start_, write_buffer_.get(), write_buffer_size_);
         write_buffer_size_ = 0;
     }
-#else
-    void FlushCache()
-    {
-		int cnt = 3;
-		do {
-			if (disk_->GetSize()==0) {
-				usleep(20);
-			} else {
-				sleep(6);
-			}
-		} while(--cnt);
-
-		disk_->SetRun();
-    }
-#endif
 
 private:
 

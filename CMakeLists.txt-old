@@ -1,7 +1,6 @@
 CMAKE_MINIMUM_REQUIRED(VERSION 3.14 FATAL_ERROR)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(CMAKE_VERBOSE_MAKEFILE ON)
 
 IF(NOT CMAKE_BUILD_TYPE)
   SET(CMAKE_BUILD_TYPE "RELEASE")
@@ -46,15 +45,6 @@ set(FSE_FILES
     ${FSE_LIB}/hist.c
 )
 
-option(DFREE_WRITE "queue for recvfrom" ON)
-if (${DFREE_WRITE})
-	message(STATUS "DFREE_WRITE is ==== " ${DFREE_WRITE})
-	add_definitions(
-		-DFREE_WRITE
-		)
-endif()
-
-
 include_directories(
   ${INCLUDE_DIRECTORIES}
   ${CMAKE_CURRENT_SOURCE_DIR}/../lib/include
@@ -62,7 +52,6 @@ include_directories(
   ${gulrak_SOURCE_DIR}/include/ghc
   ${CMAKE_CURRENT_SOURCE_DIR}/../lib/FiniteStateEntropy/lib
   ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrentqueue
   ${CMAKE_CURRENT_SOURCE_DIR}/test
   )
 
